@@ -11,9 +11,11 @@ public import vibe.core.net;
 public import vibe.http.common;
 public import vibe.http.session;
 
+import vibe.core.core;
 import vibe.core.file;
 import vibe.core.log;
 import vibe.data.json;
+import vibe.http.internal.http2;
 import vibe.http.dist;
 import vibe.http.log;
 import vibe.inet.message;
@@ -90,6 +92,31 @@ HTTPListener listenHTTP(HTTPServerSettings settings, HTTPServerRequestDelegate r
 
 	synchronized (g_listenersMutex)
 		addContext(ctx);
+
+	// TLS ALPN and SNI UserData setup
+	if (settings.sslContext) {
+		if (settings.disableHTTP2) {
+			static string h1chooser(string[] arr) {
+				// we assume http/1.1 is in the list because it would error out anyways
+				return "http/1.1";
+			}
+			settings.sslContext.alpnCallback = toDelegate(&h1chooser);
+		} else if (!settings.sslContext.alpnCallback) {
+			static string h2chooser(string[] arr) {
+				import std.algorithm : canFind;
+				string[] choices = ["h2", "h2-16", "h2-14", "http/1.1"];
+				foreach (choice; choices) {
+					if (arr.canFind(choice))
+						return choice;
+				}
+				return "";
+			}
+			settings.sslContext.alpnCallback = toDelegate(&h2chooser);
+		}
+		else {
+			logDebug("Cannot register HTTP/2");
+		}
+	}
 
 	// if a VibeDist host was specified on the command line, register there instead of listening
 	// directly.
@@ -231,7 +258,8 @@ HTTPServerRequest createTestHTTPServerRequest(URL url, HTTPMethod method, InetHe
 	ret.method = method;
 	ret.ssl = ssl;
 	ret.headers = headers;
-	ret.bodyReader = data;
+	ret.m_bodyReader = data;
+	ret.m_bodyFiltersReady = true; // Q? should `data` be the raw or logical body contents?
 	return ret;
 }
 
@@ -248,8 +276,8 @@ HTTPServerResponse createTestHTTPServerResponse(OutputStream data_sink = null, S
 		settings.sessionStore = session_store;
 	}
 	if (!data_sink) data_sink = new NullOutputStream;
-	auto stream = new ProxyStream(null, data_sink);
-	auto ret = new HTTPServerResponse(stream, null, settings, defaultAllocator());
+	auto stream = new ConnectionProxyStream(new ProxyStream(null, data_sink), null);
+	auto ret = new HTTPServerResponse(stream, null, null, settings, defaultAllocator());
 	return ret;
 }
 
@@ -461,6 +489,12 @@ final class HTTPServerSettings {
 		return ret;
 	}
 
+	/// Disable support for HTTP/2 connection handling
+	bool disableHTTP2 = false;
+
+	/// The HTTP/2 settings for this domain
+	HTTP2Settings http2Settings;
+
 	/// Disable support for VibeDist and instead start listening immediately.
 	bool disableDistHost = false;
 
@@ -540,6 +574,13 @@ final class HTTPServerRequest : HTTPRequest {
 		FixedAppender!(string, 31) m_dateAppender;
 		HTTPServerSettings m_settings;
 		ushort m_port;
+
+		// bodyReader filters
+		FreeListRef!TimeoutHTTPInputStream m_timeoutStream;
+		FreeListRef!LimitedHTTPInputStream m_limitedStream;
+		FreeListRef!ChunkedInputStream m_chunkedStream;
+		InputStream m_bodyReader;
+		bool m_bodyFiltersReady = false;
 	}
 
 	public {
@@ -609,17 +650,6 @@ final class HTTPServerRequest : HTTPRequest {
 		*/
 		string[string] params;
 
-		/** Supplies the request body as a stream.
-
-			Note that when certain server options are set (such as
-			HTTPServerOption.parseJsonBody) and a matching request was sent,
-			the returned stream will be empty. If needed, remove those
-			options and do your own processing of the body when launching
-			the server. HTTPServerOption has a list of all options that affect
-			the request body.
-		*/
-		InputStream bodyReader;
-
 		/** Contains the parsed Json for a JSON request.
 
 			Remarks:
@@ -669,11 +699,12 @@ final class HTTPServerRequest : HTTPRequest {
 		}
 	}
 
-	this(SysTime time, ushort port)
+	/// private
+	this(SysTime reqtime, ushort port)
 	{
-		m_timeCreated = time.toUTC();
+		m_timeCreated = reqtime;
 		m_port = port;
-		writeRFC822DateTimeString(m_dateAppender, time);
+		writeRFC822DateTimeString(m_dateAppender, m_timeCreated);
 		this.headers["Date"] = m_dateAppender.data();
 	}
 
@@ -732,6 +763,54 @@ final class HTTPServerRequest : HTTPRequest {
 		auto depth = count(path[1 .. $], '/');
 		return depth == 0 ? "./" : replicate("../", depth);
 	}
+
+	/** Supplies the request body as a stream.
+
+		Note that when certain server options are set (such as
+		HTTPServerOption.parseJsonBody) and a matching request was sent,
+		the returned stream will be empty. If needed, remove those
+		options and do your own processing of the body when launching
+		the server. HTTPServerOption has a list of all options that affect
+		the request body.
+	*/
+	@property InputStream bodyReader()
+	{
+		// TODO: return null if the request has no body!
+
+		// m_limitedStream set indicates that the body reader filters are in place already
+		if (m_bodyFiltersReady) return m_bodyReader;
+
+		m_bodyFiltersReady = true;
+
+		if (!m_settings) {
+			logDebug("No m_settings defined!");
+			m_limitedStream = FreeListRef!LimitedHTTPInputStream(m_bodyReader, 0);
+			m_bodyReader = m_limitedStream;
+			return m_bodyReader;
+		}
+		
+		if (m_settings.maxRequestTime != Duration.zero) {
+			m_timeoutStream = FreeListRef!TimeoutHTTPInputStream(m_bodyReader, m_settings.maxRequestTime, m_timeCreated);
+			m_bodyReader = m_timeoutStream;
+		}
+		
+		// limit request size
+		if (auto pcl = "Content-Length" in this.headers) {
+			string v = *pcl;
+			ulong contentLength = v.parse!ulong;
+			enforceBadRequest(v.length == 0, "Invalid content-length");
+			enforceBadRequest(m_settings.maxRequestSize == 0 || contentLength <= m_settings.maxRequestSize, "Request size too big");
+			m_limitedStream = FreeListRef!LimitedHTTPInputStream(m_bodyReader, contentLength);
+		} else if (auto pt = "Transfer-Encoding" in this.headers) {
+			// allow chunked because HTTP/2 cleartext upgrade stream #1 might use it
+			m_chunkedStream = FreeListRef!ChunkedInputStream(m_bodyReader);
+			m_limitedStream = FreeListRef!LimitedHTTPInputStream(m_chunkedStream, m_settings.maxRequestSize, true);
+		} else {
+			m_limitedStream = FreeListRef!LimitedHTTPInputStream(m_bodyReader, 0);
+		}
+		m_bodyReader = m_limitedStream;
+		return m_bodyReader;
+	}
 }
 
 
@@ -740,32 +819,97 @@ final class HTTPServerRequest : HTTPRequest {
 */
 final class HTTPServerResponse : HTTPResponse {
 	private {
-		Stream m_conn;
-		ConnectionStream m_rawConnection;
-		OutputStream m_bodyWriter;
 		Allocator m_requestAlloc;
-		FreeListRef!ChunkedOutputStream m_chunkedBodyWriter;
-		FreeListRef!CountingOutputStream m_countingWriter;
-		FreeListRef!GzipOutputStream m_gzipOutputStream;
-		FreeListRef!DeflateOutputStream m_deflateOutputStream;
+		ConnectionStream m_tcpStream;
+		TLSStream m_tlsStream;
+		HTTP2Stream m_http2Stream;
+		ChunkedOutputStream m_chunkedBodyWriter; /// Sends chunks of data after every flush
+		CountingOutputStream m_countingWriter; /// Counts content-length to validate the value specified in the headers
+		GzipOutputStream m_gzipOutputStream;
+		DeflateOutputStream m_deflateOutputStream;
 		HTTPServerSettings m_settings;
 		Session m_session;
+
 		bool m_headerWritten = false;
-		bool m_isHeadResponse = false;
-		bool m_ssl;
+		bool m_isHeadResponse;
+		bool m_outputStream;
 		SysTime m_timeFinalized;
 	}
 
+
+	/// Identifies the stream most suitable for writing through
+	private {
+		@property OutputStream outputStream()
+		{
+			if (!m_outputStream) return null;
+			if (m_gzipOutputStream) return m_gzipOutputStream;
+			if (m_deflateOutputStream) return m_deflateOutputStream;
+			if (m_chunkedBodyWriter) return m_chunkedBodyWriter;
+			return m_countingWriter;
+		}
+
+		@property Stream topStream()
+		{
+			if (m_http2Stream) return m_http2Stream;
+			if (m_tlsStream) return m_tlsStream;
+			return m_tcpStream;
+		}
+
+		@property ConnectionStream connectionStream()
+		{
+			if (m_http2Stream) return m_http2Stream;
+			return m_tcpStream;
+		}
+	}
+
+	/// Scheduled for deprecation - use `createTestHTTPServerResponse` instead.
 	this(Stream conn, ConnectionStream raw_connection, HTTPServerSettings settings, Allocator req_alloc)
 	{
-		m_conn = conn;
-		m_rawConnection = raw_connection;
-		m_countingWriter = FreeListRef!CountingOutputStream(conn);
+		if (auto tls = cast(TLSStream)conn)
+			this(raw_connection, tls, null, settings, req_alloc);
+		else this(raw_connection, null, null, settings, req_alloc);
+	}
+
+	/// private
+	this(ConnectionStream tcp_conn, TLSStream tls_stream, HTTP2Stream http2_stream, HTTPServerSettings settings, Allocator req_alloc)
+	{
+		m_tcpStream = tcp_conn;
+		m_tlsStream = tls_stream;
+		m_http2Stream = http2_stream;
 		m_settings = settings;
 		m_requestAlloc = req_alloc;
 	}
 
+	~this()
+	{
+		// The connection streams, allocator and settings were not owned by the HTTPServerResponse
+		if (!outputStream) return;
+
+		if (m_gzipOutputStream) {
+			FreeListObjectAlloc!GzipOutputStream.free(m_gzipOutputStream);
+			m_gzipOutputStream = null;
+		} else if (m_deflateOutputStream) {
+			FreeListObjectAlloc!DeflateOutputStream.free(m_deflateOutputStream);
+			m_deflateOutputStream = null;
+		}
+		
+		if (m_chunkedBodyWriter) {
+			FreeListObjectAlloc!ChunkedOutputStream.free(m_chunkedBodyWriter);
+			m_chunkedBodyWriter = null;
+		}
+		
+		if (m_countingWriter) {
+			FreeListObjectAlloc!CountingOutputStream.free(m_countingWriter);
+			m_countingWriter = null;
+		}
+	}
+
+	private @property bool isHTTP2() { return m_http2Stream !is null; }
+
 	@property SysTime timeFinalized() { return m_timeFinalized; }
+
+	/// Determines if compression is used in this response.
+	@property bool hasCompression() { return m_gzipOutputStream || m_deflateOutputStream; }
 
 	/** Determines if the HTTP header has already been written.
 	*/
@@ -777,7 +921,7 @@ final class HTTPServerResponse : HTTPResponse {
 
 	/** Determines if the response is sent over an encrypted connection.
 	*/
-	bool ssl() const { return m_ssl; }
+	bool ssl() const { return m_tlsStream !is null; }
 
 	/// Writes the entire response body at once.
 	void writeBody(in ubyte[] data, string content_type = null)
@@ -819,9 +963,9 @@ final class HTTPServerResponse : HTTPResponse {
 		assert(!m_headerWritten, "A body was already written!");
 		writeHeader();
 		if (m_isHeadResponse) return;
-
+		
 		auto bytes = stream.size - stream.tell();
-		m_conn.write(stream);
+		topStream.write(stream);
 		m_countingWriter.increment(bytes);
 	}
 	/// ditto
@@ -830,11 +974,10 @@ final class HTTPServerResponse : HTTPResponse {
 		assert(!m_headerWritten, "A body was already written!");
 		writeHeader();
 		if (m_isHeadResponse) return;
-
 		if (num_bytes > 0) {
-			m_conn.write(stream, num_bytes);
+			topStream.write(stream, num_bytes);
 			m_countingWriter.increment(num_bytes);
-		} else  m_countingWriter.write(stream, num_bytes);
+		} else m_countingWriter.write(stream, num_bytes);
 	}
 	/// ditto
 	void writeRawBody(RandomAccessStream stream, int status)
@@ -899,51 +1042,55 @@ final class HTTPServerResponse : HTTPResponse {
 	*/
 	@property OutputStream bodyWriter()
 	{
-		assert(m_conn !is null);
-		if (m_bodyWriter) return m_bodyWriter;
-
+		if (outputStream) {
+			logDebug("Returning existing outputstream: ", cast(void*) outputStream);
+			return outputStream;
+		}
+		logDebug("Calculating bodyWriter");
 		assert(!m_headerWritten, "A void body was already written!");
+
+		m_outputStream = true;
 
 		if (m_isHeadResponse) {
 			// for HEAD requests, we define a NullOutputWriter for convenience
 			// - no body will be written. However, the request handler should call writeVoidBody()
 			// and skip writing of the body in this case.
-			if ("Content-Length" !in headers)
+			if ("Content-Length" !in headers) {
 				headers["Transfer-Encoding"] = "chunked";
+			}
 			writeHeader();
-			m_bodyWriter = new NullOutputStream;
-			return m_bodyWriter;
+			return nullSink();
 		}
 
-		if ("Content-Encoding" in headers && "Content-Length" in headers) {
+		if (("Content-Encoding" in headers || "Transfer-Encoding" in headers) && "Content-Length" in headers) {
 			// we do not known how large the compressed body will be in advance
 			// so remove the content-length and use chunked transfer
 			headers.remove("Content-Length");
 		}
 
-		if ("Content-Length" in headers) {
+		m_countingWriter = FreeListObjectAlloc!CountingOutputStream.alloc(topStream);
+
+		if ("Content-Length" in headers || isHTTP2) {
 			writeHeader();
-			m_bodyWriter = m_countingWriter; // TODO: LimitedOutputStream(m_conn, content_length)
 		} else {
 			headers["Transfer-Encoding"] = "chunked";
 			writeHeader();
-			m_chunkedBodyWriter = FreeListRef!ChunkedOutputStream(m_countingWriter);
-			m_bodyWriter = m_chunkedBodyWriter;
+			m_chunkedBodyWriter = FreeListObjectAlloc!ChunkedOutputStream.alloc(m_countingWriter);
 		}
 
 		if (auto pce = "Content-Encoding" in headers) {
-			if (*pce == "gzip") {
-				m_gzipOutputStream = FreeListRef!GzipOutputStream(m_bodyWriter);
-				m_bodyWriter = m_gzipOutputStream;
-			} else if (*pce == "deflate") {
-				m_deflateOutputStream = FreeListRef!DeflateOutputStream(m_bodyWriter);
-				m_bodyWriter = m_deflateOutputStream;
+			if (icmp2(*pce, "gzip") == 0) {
+				m_gzipOutputStream = FreeListObjectAlloc!GzipOutputStream.alloc(outputStream);
+			} else if (icmp2(*pce, "deflate") == 0) {
+				m_deflateOutputStream = FreeListObjectAlloc!DeflateOutputStream.alloc(outputStream);
 			} else {
-				logWarn("Unsupported Content-Encoding set in response: '"~*pce~"'");
+				logWarn("Attemped to return body with a Content-Encoding which is not supported: %s", *pce);
 			}
 		}
 
-		return m_bodyWriter;
+		// todo: Add TE header support, and Transfer-Encoding: gzip, chunked
+
+		return outputStream;
 	}
 
 	/** Sends a redirect request to the client.
@@ -991,7 +1138,9 @@ final class HTTPServerResponse : HTTPResponse {
 		statusCode = HTTPStatus.SwitchingProtocols;
 		headers["Upgrade"] = protocol;
 		writeVoidBody();
-		return new ConnectionProxyStream(m_conn, m_rawConnection);
+		auto ts = topStream;
+		if (auto cs = cast(ConnectionStream)ts) return cs;
+		return new ConnectionProxyStream(ts, m_tcpStream);
 	}
 
 	/** Sets the specified cookie value.
@@ -1052,7 +1201,12 @@ final class HTTPServerResponse : HTTPResponse {
 		m_session = Session.init;
 	}
 
-	@property ulong bytesWritten() { return m_countingWriter.bytesWritten; }
+	/// Returns the number of bytes currently flushed to the connection stream after all encodings are processed,
+	/// including the size of the chunk size specifier if applicable. HEAD response are generally 0
+	@property ulong bytesWritten()
+	{
+		return m_countingWriter ? m_countingWriter.bytesWritten : 0;
+	}
 
 	/**
 		Compatibility version of render() that takes a list of explicit names and types instead
@@ -1096,51 +1250,75 @@ final class HTTPServerResponse : HTTPResponse {
 	*/
 	bool waitForConnectionClose(Duration timeout = Duration.max)
 	{
-		if (!m_rawConnection || !m_rawConnection.connected) return true;
-		m_rawConnection.waitForData(timeout);
-		return !m_rawConnection.connected;
+		if (!connectionStream || !connectionStream.connected) return true;
+		connectionStream.waitForData(timeout);
+		return !connectionStream.connected;
 	}
 
 	// Finalizes the response. This is called automatically by the server.
 	private void finalize()
 	{
+		assert(outputStream !is null);
 		if (m_gzipOutputStream) {
 			m_gzipOutputStream.finalize();
-			m_gzipOutputStream.destroy();
+			FreeListObjectAlloc!GzipOutputStream.free(m_gzipOutputStream);
+			m_gzipOutputStream = null;
 		}
 		if (m_deflateOutputStream) {
 			m_deflateOutputStream.finalize();
-			m_deflateOutputStream.destroy();
+			FreeListObjectAlloc!DeflateOutputStream.free(m_deflateOutputStream);
+			m_deflateOutputStream = null;
 		}
+
 		if (m_chunkedBodyWriter) {
 			m_chunkedBodyWriter.finalize();
-			m_chunkedBodyWriter.destroy();
+			FreeListObjectAlloc!ChunkedOutputStream.free(m_chunkedBodyWriter);
+			m_chunkedBodyWriter = null;
 		}
+
+		FreeListObjectAlloc!CountingOutputStream.free(m_countingWriter);
+		m_countingWriter = null;
 
 		// ignore exceptions caused by an already closed connection - the client
 		// may have closed the connection already and this doesn't usually indicate
 		// a problem.
-		try m_conn.flush();
+		try {
+			if (!isHTTP2) topStream.flush();
+			// flush yields on HTTP/2, finalize instead will attempt an atomic response before flushing, in case no flushes were made previously.
+			else connectionStream.finalize(); 	
+		}
 		catch (Exception e) logDebug("Failed to flush connection after finishing HTTP response: %s", e.msg);
 
 		m_timeFinalized = Clock.currTime(UTC());
 
-		if (!isHeadResponse && bytesWritten < headers.get("Content-Length", "0").to!long) {
+		if (!isHeadResponse && this.bytesWritten < headers.get("Content-Length", "0").to!long) {
 			logDebug("HTTP response only written partially before finalization. Terminating connection.");
-			m_rawConnection.close();
+			connectionStream.close();
 		}
+		else if (m_http2Stream)
+			connectionStream.close(); // HTTP/2 stream can be closed safely here
 
-		m_conn = null;
-		m_rawConnection = null;
+		m_tcpStream = null;
+		m_tlsStream = null;
+		m_http2Stream = null;
+		m_settings = null;
+		if (m_session) m_session.destroy();
 	}
 
 	private void writeHeader()
 	{
 		import vibe.stream.wrapper;
 
-		assert(!m_bodyWriter && !m_headerWritten, "Try to write header after body has already begun.");
+		assert(!m_headerWritten, "Try to write header after body has already begun.");
 		m_headerWritten = true;
-		auto dst = StreamOutputRange(m_conn);
+
+		if (isHTTP2) {
+			// Use integrated header writer
+			m_http2Stream.writeHeader(cast(HTTPStatus)this.statusCode, this.headers, this.cookies); 
+			return;
+		}
+
+		auto dst = StreamOutputRange(outputStream);
 
 		void writeLine(T...)(string fmt, T args)
 		{
@@ -1175,7 +1353,10 @@ final class HTTPServerResponse : HTTPResponse {
 		// finalize response header
 		dst.put("\r\n");
 		dst.flush();
-		m_conn.flush();
+
+		// This would break atomic responses for HTTP/2
+		if (!isHTTP2)
+			topStream.flush();
 	}
 }
 
@@ -1394,9 +1575,10 @@ private void listenHTTPPlain(HTTPServerSettings settings)
 		foreach (ctx; contexts) {
 			if (ctx.settings.port != settings.port) continue;
 			if (!ctx.settings.bindAddresses.canFind(lst.bindAddress)) continue;
-			/*enforce(ctx.settings.hostName != settings.hostName,
-				"A server with the host name '"~settings.hostName~"' is already "
-				"listening on "~addr~":"~to!string(settings.port)~".");*/
+
+			assert(ctx.settings.hostName, "Cannot setup virtual hosts on "~lst.bindAddress~":"~to!string(settings.port) ~ ": one of the HTTP listeners has no hostName set.");
+			//assert(ctx.settings.hostName != settings.hostName, "A server with the host name '"~settings.hostName~"' is already "
+			//	"listening on "~lst.bindAddress~":"~to!string(settings.port)~". You must call listenHTTP at most once for every hostName in the server settings.");
 		}
 	}
 
@@ -1434,11 +1616,161 @@ private void listenHTTPPlain(HTTPServerSettings settings)
 	enforce(any_successful, "Failed to listen for incoming HTTP connections on any of the supplied interfaces.");
 }
 
+private Nullable!HTTPServerContext getServerContext(ref HTTPListenInfo listen_info, string authority /* example.com:port */)
+{
+	string reqhost;
+	ushort reqport = 0;
+	import std.algorithm : splitter;
+	auto reqhostparts = authority.splitter(":");
+	if (!reqhostparts.empty) { reqhost = reqhostparts.front; reqhostparts.popFront(); }
+	if (!reqhostparts.empty) { reqport = reqhostparts.front.to!ushort; reqhostparts.popFront(); }
+	enforce(reqhostparts.empty, "Invalid suffix found in host header");
+	
+	foreach (ctx; getContexts())
+		if (icmp2(ctx.settings.hostName, reqhost) == 0 && (!reqport || reqport == ctx.settings.port))
+			if (ctx.settings.port == listen_info.bindPort)
+				foreach (addr; ctx.settings.bindAddresses)
+					if (addr == listen_info.bindAddress)
+						return Nullable!HTTPServerContext(ctx);
+
+	return Nullable!HTTPServerContext.init;
+}
+
+private Nullable!HTTPServerContext getServerContext(ref HTTPListenInfo listen_info)
+{
+	foreach (ctx; getContexts())
+		if (ctx.settings.port == listen_info.bindPort)
+			foreach (addr; ctx.settings.bindAddresses)
+				if (addr == listen_info.bindAddress)
+					return Nullable!HTTPServerContext(ctx);
+
+	return Nullable!HTTPServerContext.init;
+}
+
+private struct HTTP2HandlerContext
+{
+	bool started;
+	
+	TCPConnection tcpConn;
+	TLSStream tlsStream;
+	HTTP2Session session;
+	
+	HTTPListenInfo listenInfo;
+	HTTPServerContext context;
+	
+	// Used only in h2c upgrade, to allow the loop to be kept active after the response is sent
+	// we can't end the scope because the response will need to happen through HTTP/2
+	Task evloop;
+	
+	@property bool isUpgrade() { return evloop != Task(); }
+	@property bool isTLS() { return tlsStream?true:false; }
+	
+	~this() {
+		if (session) {
+			FreeListObjectAlloc!HTTP2Session.free(session);
+			session = null;
+		}
+	}
+	
+	this(TCPConnection tcp_conn, TLSStream tls_stream, HTTPListenInfo listen_info, HTTPServerContext _context) {
+		listenInfo = listen_info;
+		tcpConn = tcp_conn;
+		tlsStream = tls_stream;
+		context = _context;
+	}
+
+	void close(string error) {
+		session.stop(error);
+	}
+	
+	bool tryStart(string chosen_alpn)
+	{
+		assert(!started);
+		
+		// see if the client has an HTTP/2 preface for a quick cleartext upgrade attempt
+		if (!tlsStream)
+		{
+			ulong preface_length = tcpConn.leastSize();
+			if (preface_length >= 24 && tcpConn.peek()[0 .. 24] == "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+			{
+				startHTTP2(); // event loop starts here
+				return true;
+			}
+		}
+		// We check for HTTP/2 over secured connection with ALPN
+		else if (context.settings && !context.settings.disableHTTP2 && chosen_alpn.length >= 2 && chosen_alpn[0 .. 2] == "h2")
+		{
+			startTLSHTTP2();
+			return true;
+		}
+		
+		return false;
+	}
+	
+	void startTLSHTTP2() { // using ALPN prior knowledge over secured stream. Restrict to a specific context
+		started = true;
+		HTTP2Settings local_settings;
+		if (context.settings)
+			local_settings = context.settings.http2Settings;
+		session = FreeListObjectAlloc!HTTP2Session.alloc(true, &handler, tcpConn, tlsStream, local_settings);
+		session.run(); // blocks, loops and handles requests here
+	}
+	
+	void startHTTP2() { // using prior knowledge over cleartext
+		started = true;
+		HTTP2Settings local_settings;
+		if (context.settings)
+			local_settings = context.settings.http2Settings;
+		session = FreeListObjectAlloc!HTTP2Session.alloc(true, &handler, tcpConn, null, local_settings);
+		session.run(); // blocks, loops and handles requests here
+	}
+	
+	HTTP2Stream tryStartUpgrade(ref InetHeaderMap headers)
+	{
+		// assert(!isTLS, "Can only upgrade over cleartext TCP");
+
+		// using HTTP/1.1 upgrade mechanism over cleartext
+		string upgrade_hd = headers.get("Upgrade", null);
+		if (!upgrade_hd || upgrade_hd.length < 3 || upgrade_hd[0 .. 3] != "h2c")
+			return null;
+		
+		string connection_hd = headers.get("Connection", null);
+		if (!connection_hd || icmp2(connection_hd, "Upgrade, HTTP2-Settings") != 0)
+			return null;
+		
+		string base64_settings = headers.get("HTTP2-Settings", null);
+		if (!base64_settings)
+			return null;
+
+		HTTP2Settings local_settings;
+		if (context.settings)
+			local_settings = context.settings.http2Settings;
+
+		session = FreeListObjectAlloc!HTTP2Session.alloc(&handler, tcpConn, cast(ubyte[]) base64_settings, local_settings);
+		tcpConn.write("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n");
+		evloop = runTask( { session.run(); } );
+		started = true;
+		return session.getUpgradeStream();
+	}
+	
+	void continueHTTP2Upgrade() {
+		started = true;
+		// for upgrade mechanism, let the event loop accept new connections through HTTP/2
+		if (evloop != Task())
+			evloop.join();
+		// the handleRequest scope stays active while connected once the initial request is handled
+	}
+	
+	void handler(HTTP2Stream stream)
+	{
+		bool keep_alive = false;
+		.handleRequest(tcpConn, tlsStream, stream, listenInfo, context, this, keep_alive);
+	}
+}
+
 
 private void handleHTTPConnection(TCPConnection connection, HTTPListenInfo listen_info)
 {
-	Stream http_stream = connection;
-
 	version(VibeNoSSL) {} else {
 		import std.traits : ReturnType;
 		ReturnType!createSSLStreamFL ssl_stream;
@@ -1449,26 +1781,51 @@ private void handleHTTPConnection(TCPConnection connection, HTTPListenInfo liste
 		return;
 	}
 
-	// If this is a HTTPS server, initiate SSL
+	string chosen_alpn;
 	if (listen_info.sslContext) {
+		logTrace("Accept TLS connection: %s", listen_info.sslContext.kind);
+		// TODO: reverse DNS lookup for peer_name of the incoming connection for TLS client certificate verification purposes
 		version (VibeNoSSL) assert(false, "No SSL support compiled in (VibeNoSSL)");
 		else {
-			logDebug("Accept SSL connection: %s", listen_info.sslContext.kind);
-			// TODO: reverse DNS lookup for peer_name of the incoming connection for SSL client certificate verification purposes
-			ssl_stream = createSSLStreamFL(http_stream, listen_info.sslContext, SSLStreamState.accepting, null, connection.remoteAddress);
-			http_stream = ssl_stream;
+			ssl_stream = createTLSStreamFL(connection, listen_info.sslContext, TLSStreamState.accepting, null, connection.remoteAddress);
 		}
+		chosen_alpn = ssl_stream.alpn;
+		logTrace("Chose alpn: %s", chosen_alpn);
 	}
+	auto contextn = listen_info.getServerContext();
+	if (contextn.isNull()) {
+		logWarn("No HTTP listen context for incoming connection. Disconnecting.");
+		connection.close();
+		return;
+	}
+	auto context = contextn.get();
 
+	//assert(context.settings, "Request being loaded without settings");
+	auto http2_handler = HTTP2HandlerContext(connection, ssl_stream, listen_info, context);
+	
+	// Will block here if it succeeds. The handler is kept handy in case HTTP/2 Upgrade is attempted in the headers of an HTTP/1.1 request
+	if (http2_handler.tryStart(chosen_alpn))
+		// HTTP/2 session terminated, exit
+		return;
+	else if (ssl_stream)
+		// That was the only way to start HTTP/2 over TLS
+		http2_handler.destroy();
+	
+	/// Loop for HTTP/1.1 or HTTP/1.0 only
 	do {
-		HTTPServerSettings settings;
 		bool keep_alive;
-		handleRequest(http_stream, connection, listen_info, settings, keep_alive);
+		handleRequest(connection, ssl_stream, null, listen_info, context, http2_handler, keep_alive);
+		
+		if (http2_handler.isUpgrade) {
+			// The HTTP/2 Upgrade request was turned into HTTP/2 stream ID#1, we can now listen for more with an HTTP/2 session
+			http2_handler.continueHTTP2Upgrade();
+			return;
+		}
 		if (!keep_alive) { logTrace("No keep-alive - disconnecting client."); break; }
-
+		
 		logTrace("Waiting for next request...");
 		// wait for another possible request on a keep-alive connection
-		if (!connection.waitForData(settings.keepAliveTimeout)) {
+		if (!connection.waitForData(context.settings.keepAliveTimeout)) {
 			if (!connection.connected) logTrace("Client disconnected.");
 			else logDebug("Keep-alive connection timed out!");
 			break;
@@ -1478,39 +1835,45 @@ private void handleHTTPConnection(TCPConnection connection, HTTPListenInfo liste
 	logTrace("Done handling connection.");
 }
 
-private bool handleRequest(Stream http_stream, TCPConnection tcp_connection, HTTPListenInfo listen_info, ref HTTPServerSettings settings, ref bool keep_alive)
+private bool handleRequest(TCPConnection tcp_conn,
+	TLSStream tls_stream, 
+	HTTP2Stream http2_stream,
+	HTTPListenInfo listen_info,
+	ref HTTPServerContext context,
+	ref HTTP2HandlerContext http2_handler,
+	ref bool keep_alive)
 {
-	import std.algorithm : canFind;
+	auto settings = context.settings;
 
-	auto peer_address_string = tcp_connection.peerAddress;
-	auto peer_address = tcp_connection.remoteAddress;
+	ConnectionStream http_stream() 
+	{ 
+		if (http2_stream !is null)
+			return cast(ConnectionStream) http2_stream;
+		if (tls_stream !is null)
+			return cast(ConnectionStream) tls_stream;
+		return cast(ConnectionStream) tcp_conn;
+	}
+
 	SysTime reqtime = Clock.currTime(UTC());
-
-	//auto request_allocator = scoped!(PoolAllocator)(1024, defaultAllocator());
-	scope request_allocator = new PoolAllocator(1024, defaultAllocator());
-	scope(exit) request_allocator.reset();
 
 	// some instances that live only while the request is running
 	FreeListRef!HTTPServerRequest req = FreeListRef!HTTPServerRequest(reqtime, listen_info.bindPort);
-	FreeListRef!TimeoutHTTPInputStream timeout_http_input_stream;
-	FreeListRef!LimitedHTTPInputStream limited_http_input_stream;
-	FreeListRef!ChunkedInputStream chunked_input_stream;
 
-	// Default to the first virtual host for this listener
-	HTTPServerRequestDelegate request_task;
-	HTTPServerContext context;
-	foreach (ctx; getContexts())
-		if (ctx.settings.port == listen_info.bindPort) {
-			bool found = false;
-			foreach (addr; ctx.settings.bindAddresses)
-				if (addr == listen_info.bindAddress)
-					found = true;
-			if (!found) continue;
-			context = ctx;
-			settings = ctx.settings;
-			request_task = ctx.requestHandler;
-			break;
-		}
+	// store the IP address (IPv4 addresses forwarded over IPv6 are stored in IPv4 format)
+	if (tcp_conn.peerAddress.startsWith("::ffff:") && tcp_conn.peerAddress[7 .. $].indexOf(":") < 0)
+		req.peer = tcp_conn.peerAddress[7 .. $];
+	else req.peer = tcp_conn.peerAddress;
+	req.clientAddress = tcp_conn.remoteAddress;
+
+	bool parsed = false;
+	/*bool*/ keep_alive = false;
+
+	// Used for the parser and the HTTPServerResponse
+	PoolAllocator request_allocator = FreeListObjectAlloc!PoolAllocator.alloc(1024, defaultAllocator());
+	scope(exit) {
+		request_allocator.reset();
+		FreeListObjectAlloc!PoolAllocator.free(request_allocator);
+	}
 
 	if (!settings) {
 		logWarn("Didn't find a HTTP listening context for incoming connection. Dropping.");
@@ -1519,9 +1882,7 @@ private bool handleRequest(Stream http_stream, TCPConnection tcp_connection, HTT
 	}
 
 	// Create the response object
-	auto res = FreeListRef!HTTPServerResponse(http_stream, tcp_connection, settings, request_allocator/*.Scoped_payload*/);
-	req.ssl = res.m_ssl = listen_info.sslContext !is null;
-	if (req.ssl) req.clientCertificate = (cast(SSLStream)http_stream).peerCertificate;
+	auto res = FreeListRef!HTTPServerResponse(cast(ConnectionStream)tcp_conn, tls_stream, http2_stream, settings, request_allocator);
 
 	// Error page handler
 	void errorOut(int code, string msg, string debug_msg, Throwable ex){
@@ -1541,97 +1902,94 @@ private bool handleRequest(Stream http_stream, TCPConnection tcp_connection, HTT
 		} else {
 			res.writeBody(format("%s - %s\n\n%s\n\nInternal error information:\n%s", code, httpStatusText(code), msg, debug_msg));
 		}
-		assert(res.headerWritten);
+		assert(res.headerWritten, "Error page handler did not write a body!");
 	}
-
-	bool parsed = false;
-	/*bool*/ keep_alive = false;
 
 	// parse the request
 	try {
 		logTrace("reading request..");
+		// During an upgrade, we would need to read with HTTP/1.1 and write with HTTP/2, 
+		// so we define the InputStream before the upgrade starts
+		req.m_bodyReader = http_stream;
 
-		// limit the total request time
-		InputStream reqReader;
-		if (settings.maxRequestTime == dur!"seconds"(0)) reqReader = http_stream;
-		else {
-			timeout_http_input_stream = FreeListRef!TimeoutHTTPInputStream(http_stream, settings.maxRequestTime, reqtime);
-			reqReader = timeout_http_input_stream;
+		if (!http2_stream) {
+			// HTTP/1.1 headers
+			parseRequestHeader(req, http_stream, request_allocator, settings.maxRequestHeaderSize);
+
+			// find/verify context
+			string authority = req.headers.get("Host", null);
+			enforceBadRequest(authority, "No Host header was defined");
+
+			auto contextn = listen_info.getServerContext(authority);
+			if (!contextn.isNull()) context = contextn;
+
+			// Replace topStream with the HTTP/2 stream
+			if (!settings.disableHTTP2 && !tls_stream)
+				http2_stream = http2_handler.tryStartUpgrade(req.headers);
+		}
+		else
+		{ 
+			// HTTP/2 headers
+			enforce(http2_handler.started, "HTTP/2 session is invalid");
+			parseHTTP2RequestHeader(req, http2_stream, request_allocator);
+
+			// find/verify context
+			string authority = req.headers.get("Host", null);
+			enforceBadRequest(authority, "No Host header was defined");
+
+			enforceBadRequest(listen_info.getServerContext(authority) == http2_handler.context, "Invalid hostname requested for this session.");
 		}
 
-		// store the IP address (IPv4 addresses forwarded over IPv6 are stored in IPv4 format)
-		if (peer_address_string.startsWith("::ffff:") && peer_address_string[7 .. $].indexOf(":") < 0)
-			req.peer = peer_address_string[7 .. $];
-		else req.peer = peer_address_string;
-		req.clientAddress = peer_address;
-
-		// basic request parsing
-		parseRequestHeader(req, reqReader, request_allocator, settings.maxRequestHeaderSize);
 		logTrace("Got request header.");
 
-		// find the matching virtual host
-		string reqhost;
-		ushort reqport = 0;
-		import std.algorithm : splitter;
-		auto reqhostparts = req.host.splitter(":");
-		if (!reqhostparts.empty) { reqhost = reqhostparts.front; reqhostparts.popFront(); }
-		if (!reqhostparts.empty) { reqport = reqhostparts.front.to!ushort; reqhostparts.popFront(); }
-		enforce(reqhostparts.empty, "Invalid suffix found in host header");
-		foreach (ctx; getContexts())
-			if (icmp2(ctx.settings.hostName, reqhost) == 0 &&
-				(!reqport || reqport == ctx.settings.port))
-			{
-				if (ctx.settings.port != listen_info.bindPort) continue;
-				bool found = false;
-				foreach (addr; ctx.settings.bindAddresses)
-					if (addr == listen_info.bindAddress)
-						found = true;
-				if (!found) continue;
-				context = ctx;
-				settings = ctx.settings;
-				request_task = ctx.requestHandler;
-				break;
-			}
 		req.m_settings = settings;
-		res.m_settings = settings;
+		
+		scope(exit) {
+			// Flush the body if it still contains data when we're done
+			if (http_stream.connected) {
+				if (req.bodyReader && !req.bodyReader.empty) {
+					nullSink().write(req.bodyReader);
+					logTrace("dropped body");
+				}
+				
+				// finalize (e.g. for chunked encoding)
+				if (res) res.finalize();
+			}
+		}
+		if (req.ssl)
+			req.clientCertificate = tls_stream.peerCertificate;
 
-		// setup compressed output
+		// Setup compressed output with client priority ordering
 		if (settings.useCompressionIfPossible) {
 			if (auto pae = "Accept-Encoding" in req.headers) {
-				if (canFind(*pae, "gzip")) {
-					res.headers["Content-Encoding"] = "gzip";
-				} else if (canFind(*pae, "deflate")) {
-					res.headers["Content-Encoding"] = "deflate";
+				immutable(char)* c = (*pae).ptr;
+				for (size_t i = 0; i < (*pae).length; i++) {
+					if (c[i] == 'g' || c[i] == 'G') {
+						if (icmp2(c[i .. i+4], "gzip") == 0) {
+							res.headers["Content-Encoding"] = "gzip";
+							break;
+						}
+					}
+
+					if (c[i] == 'd' || c[i] == 'D') {
+						if (icmp2(c[i .. i + "deflate".length], "deflate") == 0) {
+							res.headers["Content-Encoding"] = "deflate";
+							break;
+						}
+					}
 				}
 			}
 		}
-
-		// limit request size
-		if (auto pcl = "Content-Length" in req.headers) {
-			string v = *pcl;
-			auto contentLength = parse!ulong(v); // DMDBUG: to! thinks there is a H in the string
-			enforceBadRequest(v.length == 0, "Invalid content-length");
-			enforceBadRequest(settings.maxRequestSize <= 0 || contentLength <= settings.maxRequestSize, "Request size too big");
-			limited_http_input_stream = FreeListRef!LimitedHTTPInputStream(reqReader, contentLength);
-		} else if (auto pt = "Transfer-Encoding" in req.headers) {
-			enforceBadRequest(icmp(*pt, "chunked") == 0);
-			chunked_input_stream = FreeListRef!ChunkedInputStream(reqReader);
-			limited_http_input_stream = FreeListRef!LimitedHTTPInputStream(chunked_input_stream, settings.maxRequestSize, true);
-		} else {
-			limited_http_input_stream = FreeListRef!LimitedHTTPInputStream(reqReader, 0);
-		}
-		req.bodyReader = limited_http_input_stream;
-
 		// handle Expect header
 		if (auto pv = "Expect" in req.headers) {
-			if (*pv == "100-continue") {
+			if (icmp2(*pv, "100-continue") == 0) {
 				logTrace("sending 100 continue");
 				http_stream.write("HTTP/1.1 100 Continue\r\n\r\n");
 			}
 		}
 
-		// URL parsing if desired
-		if (settings.options & HTTPServerOption.parseURL) {
+		// URL parsing if desired. Note that http/2 automatically parsed it
+		if (req.httpVersion != HTTPVersion.HTTP_2 && settings.options & HTTPServerOption.parseURL) {
 			auto url = URL.parse(req.requestURL);
 			req.path = urlDecode(url.pathString);
 			req.queryString = url.queryString;
@@ -1672,7 +2030,7 @@ private bool handleRequest(Stream http_stream, TCPConnection tcp_connection, HTT
 		}
 
 		if (settings.options & HTTPServerOption.parseJsonBody) {
-			if (req.contentType == "application/json") {
+			if (icmp2(req.contentType, "application/json") == 0) {
 				auto bodyStr = cast(string)req.bodyReader.readAll();
 				if (!bodyStr.empty) req.json = parseJson(bodyStr);
 			}
@@ -1683,7 +2041,7 @@ private bool handleRequest(Stream http_stream, TCPConnection tcp_connection, HTT
 		if (settings.serverString.length)
 			res.headers["Server"] = settings.serverString;
 		res.headers["Date"] = formatRFC822DateAlloc(request_allocator, reqtime);
-		if (req.persistent) res.headers["Keep-Alive"] = formatAlloc(request_allocator, "timeout=%d", settings.keepAliveTimeout.total!"seconds"());
+		if (req.persistent && !http2_stream) res.headers["Keep-Alive"] = formatAlloc(request_allocator, "timeout=%d", settings.keepAliveTimeout.total!"seconds"());
 
 		// finished parsing the request
 		parsed = true;
@@ -1692,8 +2050,8 @@ private bool handleRequest(Stream http_stream, TCPConnection tcp_connection, HTT
 
 		// handle the request
 		logTrace("handle request (body %d)", req.bodyReader.leastSize);
-		res.httpVersion = req.httpVersion;
-		request_task(req, res);
+		res.httpVersion = http2_stream ? HTTPVersion.HTTP_2 : req.httpVersion;
+		context.requestHandler(req, res);
 
 		// if no one has written anything, return 404
 		if (!res.headerWritten) {
@@ -1718,21 +2076,10 @@ private bool handleRequest(Stream http_stream, TCPConnection tcp_connection, HTT
 		auto status = parsed ? HTTPStatus.internalServerError : HTTPStatus.badRequest;
 		string dbg_msg;
 		if (settings.options & HTTPServerOption.errorStackTraces) dbg_msg = e.toString().sanitize;
-		if (!res.headerWritten && tcp_connection.connected) errorOut(status, httpStatusText(status), dbg_msg, e);
+		if (!res.headerWritten && tcp_conn.connected) errorOut(status, httpStatusText(status), dbg_msg, e);
 		else logDiagnostic("Error while writing the response: %s", e.msg);
 		logDebug("Exception while handling request %s %s: %s", req.method, req.requestURL, e.toString().sanitize());
 		if (!parsed || res.headerWritten || !cast(Exception)e) keep_alive = false;
-	}
-
-	if (tcp_connection.connected) {
-		if (req.bodyReader && !req.bodyReader.empty) {
-			auto nullWriter = scoped!NullOutputStream();
-			nullWriter.write(req.bodyReader);
-			logTrace("dropped body");
-		}
-
-		// finalize (e.g. for chunked encoding)
-		res.finalize();
 	}
 
 	foreach (k, v ; req.files) {
@@ -1784,6 +2131,28 @@ private void parseRequestHeader(HTTPServerRequest req, InputStream http_stream, 
 	foreach (k, v; req.headers)
 		logTrace("%s: %s", k, v);
 	logTrace("--------------------");
+}
+
+private void parseHTTP2RequestHeader(HTTPServerRequest req, HTTP2Stream http2_stream, Allocator alloc/*, max_header_size*/) // header sizes restricted through HTTP/2 settings
+{
+	logTrace("----------------------");
+	logTrace("HTTP/2 server request:");
+	logTrace("----------------------");
+	// the entire url should be parsed here to simplify processing of pseudo-headers in HTTP/2
+	URL url;
+	http2_stream.readHeader(url, req.method, req.headers, alloc);
+	req.httpVersion = HTTPVersion.HTTP_2;
+	req.requestURL = url.pathString;
+	req.path = urlDecode(url.pathString);
+	req.queryString = url.queryString;
+	req.username = url.username;
+	req.password = url.password;
+
+	logTrace("%s", url.toString());
+
+	foreach (k, v; req.headers)
+		logTrace("%s: %s", k, v);
+	logTrace("----------------------");
 }
 
 private void parseCookies(string str, ref CookieValueMap cookies)
