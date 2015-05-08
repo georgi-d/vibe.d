@@ -15,6 +15,7 @@ import vibe.core.connectionpool;
 import vibe.core.core;
 import vibe.core.log;
 import vibe.data.json;
+import vibe.http.cookiejar;
 import vibe.http.internal.http2;
 import vibe.inet.message;
 import vibe.inet.url;
@@ -219,6 +220,9 @@ class HTTPClientSettings {
 
 	/// If left empty, the default vibe.d user-agent string will be entered automatically in the headers
 	string userAgent;
+
+	/// All cookies will be processed from and to the cookiejar if specified
+	CookieStore cookieJar;
 
 	struct HTTP2 {
 		// If enabled, the client will always send a client preface without trying upgrade or checking the ALPN value.
@@ -592,7 +596,7 @@ private:
 		Duration latency = Duration.zero;
 		logDebug("Creating scoped client");
 		auto req = scoped!HTTPClientRequest(m_conn, m_state.http2Stream, m_settings.proxyURL, user_agent, canUpgradeHTTP2,
-											m_http2Context ? m_http2Context.latency : latency, keepalive);
+											m_http2Context ? m_http2Context.latency : latency, keepalive, m_settings.cookieJar);
 		logDebug("Calling callback");
 		if (m_state.location !is URL.init) {
 			if (m_settings.proxyURL !is URL.init)
@@ -805,7 +809,9 @@ final class HTTPClientRequest : HTTPRequest {
 		HTTPClientConnection m_conn;
 		HTTP2Stream m_http2Stream;
 		OutputStream m_bodyWriter;
+		CookieStore m_cookieJar;
 		bool m_headerWritten;
+		bool m_concatCookies;
 		bool m_isUpgrading;
 		FixedAppender!(string, 22) m_contentLengthBuffer;
 		NetworkAddress m_localAddress;
@@ -821,11 +827,12 @@ final class HTTPClientRequest : HTTPRequest {
 
 	/// private
 	this(HTTPClientConnection conn, HTTP2Stream http2, URL proxy, string user_agent, bool is_http2_upgrading, 
-		 ref Duration latency, ref bool keepalive)
+		 ref Duration latency, ref bool keepalive, CookieStore cookie_jar)
 	{
 
 		m_conn = conn;
 		m_http2Stream = http2;
+		m_cookieJar = cookie_jar;
 		m_latency = &latency;
 		m_isUpgrading = is_http2_upgrading;
 
@@ -859,6 +866,9 @@ final class HTTPClientRequest : HTTPRequest {
 
 	/// Returns the last latency recorded by the HTTP/2 session
 	@property Duration latency() { return *m_latency; }
+
+	/// For HTTP/2, specify true to force cookies to be concatenated. This is not recommended because it averts header indexing.
+	@property void concatenateCookies(bool b) { m_concatCookies = b; }
 
 	@property NetworkAddress localAddress() const { return m_conn.tcp.localAddress; }
 
@@ -979,7 +989,7 @@ final class HTTPClientRequest : HTTPRequest {
 		// http/2
 		if (isHTTP2) {
 			logDebug("Writing HTTP/2 headers");
-			m_http2Stream.writeHeader(requestURL, m_conn.tlsStream ? "https" : "http", method, headers);
+			m_http2Stream.writeHeader(requestURL, m_conn.tlsStream ? "https" : "http", method, headers, m_cookieJar, m_concatCookies);
 			return;
 		}
 
@@ -995,7 +1005,17 @@ final class HTTPClientRequest : HTTPRequest {
 			formattedWrite(&output, "%s: %s\r\n", k, v);
 			logTrace("%s: %s", k, v);
 		}
+		void cookieSinkConcatenate(string cookies) {
+			if (cookies !is null && cookies != "") {
+				logDebug("Cookie: %s", cookies);
+				formattedWrite(&output, "Cookie: %s\r\n", cookies);
+			}
+
+		}
+		if (m_cookieJar !is null)
+			m_cookieJar.get(headers["Host"], requestURL, m_conn.tlsStream !is null, &cookieSinkConcatenate);
 		output.put("\r\n");
+		logDebug("Done with cookies");
 		logTrace("--------------------");
 	}
 
@@ -1112,12 +1132,22 @@ final class HTTPClientResponse : HTTPResponse {
 			m_client.finalizeHTTP2Upgrade(upgrade_hd);
 		}
 
+		void saveCookie(string value) {
+			logDebug("Save cookie: %s", value);
+			if (m_client.m_settings.cookieJar) {
+				m_client.m_settings.cookieJar.set(client.m_conn.server, value);
+			}
+		}
+
+
 		logTrace("---------------------");
 		logTrace("HTTP client response:");
 		logTrace("---------------------");
 		logTrace("%s", this);
 		foreach (k, v; this.headers) {
 			logTrace("%s: %s", k, v);
+			if (icmp2(k, "Set-Cookie") == 0)
+				saveCookie(v);
 		}
 		logTrace("---------------------");
 
